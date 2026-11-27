@@ -285,11 +285,11 @@
       </div>
     </div>
     <div class="system-status-pills">
-      <div class="status-pill live">
-        <div class="pulse-dot"></div> AI Engine Online
+      <div class="status-pill" id="ai-engine-indicator">
+        AI Engine: Checking...
       </div>
       <div class="status-pill" id="telephony-indicator">
-        Telephony: Ready
+        Telephony: Checking...
       </div>
       <button class="btn btn-secondary btn-sm" onclick="switchTab('import-tab')">+ Import Contacts</button>
       <button class="btn btn-primary btn-sm" onclick="openCampaignModal()">+ New Campaign</button>
@@ -561,6 +561,34 @@
           </table>
         </div>
       </div>
+
+      <!-- Human Escalation Tasks Card -->
+      <div class="card" style="margin-top: 1.5rem; border-color: rgba(245, 158, 11, 0.3);">
+        <div class="card-title">
+          <span>🚨 Human Escalation & Sales Follow-Up Tasks</span>
+          <span class="tab-badge" id="tasks-count-badge" style="background: rgba(245, 158, 11, 0.2); color: #FBBF24;">0</span>
+        </div>
+        <p class="card-desc">Tasks created automatically when a customer requests to speak with a live salesperson or manager.</p>
+        <div class="table-container">
+          <table>
+            <thead>
+              <tr>
+                <th>Task ID</th>
+                <th>Customer Name</th>
+                <th>Phone Number</th>
+                <th>Priority</th>
+                <th>Status</th>
+                <th>Assigned Specialist</th>
+                <th>Notes</th>
+                <th>Created At</th>
+              </tr>
+            </thead>
+            <tbody id="tasks-tbody">
+              <tr><td colspan="8" style="text-align: center; color: var(--text-dim);">No pending escalation tasks.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
     </section>
 
     <!-- TAB 5: SITE VISITS & APPOINTMENTS -->
@@ -602,13 +630,22 @@
         </div>
         <p class="card-desc">Test real-time two-way voice conversations with the AI sales representative using your browser microphone and Sarvam Realtime STT.</p>
 
-        <div style="display: flex; gap: 1rem; align-items: center; margin-bottom: 1.5rem; flex-wrap: wrap;">
-          <select id="studio-lead-select" class="form-select" style="max-width: 280px;">
-            <option value="">Select a Lead Context...</option>
+        <div style="display: flex; gap: 0.75rem; align-items: center; margin-bottom: 1.5rem; flex-wrap: wrap;">
+          <select id="studio-lead-select" class="form-select" style="max-width: 220px;">
+            <option value="">Select Lead...</option>
           </select>
-          <button id="btn-start-voice" class="btn btn-primary" onclick="startStudioCall()">🎙️ Start Realtime Call</button>
+          <select id="sim-scenario-select" class="form-select" style="max-width: 220px;">
+            <option value="answered_hot">Hot Buyer (2 BHK, 75L, Visit)</option>
+            <option value="answered_warm">Warm Buyer (1 BHK Info)</option>
+            <option value="busy">Simulate: Busy Line</option>
+            <option value="no_answer">Simulate: No Answer</option>
+            <option value="dnd_opt_out">Simulate: DND Opt-Out</option>
+            <option value="human_escalation">Simulate: Ask For Manager</option>
+            <option value="provider_failure">Simulate: Provider Failure</option>
+          </select>
+          <button id="btn-run-sim" class="btn btn-secondary" onclick="triggerSafeSimulationCall()">⚡ Run Safe Simulation Call</button>
+          <button id="btn-start-voice" class="btn btn-primary" onclick="startStudioCall()">🎙️ Start Realtime Mic</button>
           <button id="btn-stop-voice" class="btn btn-danger" onclick="stopStudioCall()" disabled>Hang Up</button>
-          <button id="btn-test-outbound" class="btn btn-secondary" onclick="triggerTestOutboundCall()">Simulate Provider Boundary</button>
         </div>
 
         <div style="display: flex; justify-content: space-between; align-items: center; font-size: 0.85rem; margin-bottom: 0.75rem;">
@@ -773,6 +810,75 @@
     </div>
   </div>
 
+  <!-- MODAL: Manual Lead Creator -->
+  <div id="add-lead-modal" class="modal-overlay">
+    <div class="modal-box" style="max-width: 550px;">
+      <div class="modal-header">
+        <h3 style="font-size: 1.15rem; font-weight: 800;">+ Add New Property Lead</h3>
+        <button class="close-btn" onclick="closeAddLeadModal()">&times;</button>
+      </div>
+      <form onsubmit="handleManualAddLead(event)">
+        <div class="modal-body">
+          <div class="form-group">
+            <label class="form-label">Customer Full Name *</label>
+            <input class="form-input" id="add-lead-name" placeholder="e.g. Anand Kulkarni" required />
+          </div>
+          <div class="form-group">
+            <label class="form-label">Phone Number *</label>
+            <input class="form-input" id="add-lead-phone" placeholder="+919876543210" required />
+          </div>
+          <div class="grid-2">
+            <div class="form-group">
+              <label class="form-label">Preferred Locality</label>
+              <input class="form-input" id="add-lead-area" value="Wakad" />
+            </div>
+            <div class="form-group">
+              <label class="form-label">BHK Preference</label>
+              <select class="form-select" id="add-lead-bhk">
+                <option value="2 BHK">2 BHK</option>
+                <option value="1 BHK">1 BHK</option>
+                <option value="3 BHK">3 BHK</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Indicative Budget</label>
+            <input class="form-input" id="add-lead-budget" placeholder="e.g. 75 Lakhs" />
+          </div>
+          <div class="form-group">
+            <label class="form-label">Initial Notes</label>
+            <textarea class="form-textarea" id="add-lead-notes" rows="2" placeholder="Customer requirements or walk-in enquiry notes..."></textarea>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" onclick="closeAddLeadModal()">Cancel</button>
+          <button type="submit" class="btn btn-primary">Save Lead to CRM</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- MODAL: Recording Playback -->
+  <div id="recording-modal" class="modal-overlay">
+    <div class="modal-box" style="max-width: 500px;">
+      <div class="modal-header">
+        <h3 style="font-size: 1.15rem; font-weight: 800;">🎧 Call Recording Playback</h3>
+        <button class="close-btn" onclick="closeRecordingModal()">&times;</button>
+      </div>
+      <div class="modal-body" style="text-align: center; padding: 2rem;">
+        <div id="recording-status-box" style="margin-bottom: 1.5rem;">
+          <div style="font-size: 2rem; margin-bottom: 0.5rem;" id="recording-status-icon">⏳</div>
+          <div style="font-weight: 700; font-size: 1rem; margin-bottom: 0.25rem;" id="recording-status-title">Loading recording...</div>
+          <div style="font-size: 0.8rem; color: var(--text-muted);" id="recording-status-desc">Querying carrier recording storage.</div>
+        </div>
+        <audio id="recording-modal-audio" controls style="width: 100%; display: none; margin-top: 1rem;"></audio>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeRecordingModal()">Close</button>
+      </div>
+    </div>
+  </div>
+
   <!-- JavaScript Frontend Controller -->
   <script>
     let activeBatchId = null;
@@ -801,14 +907,217 @@
 
     async function refreshAllData() {
       await Promise.all([
+        fetchStatusIndicators(),
         fetchAnalytics(),
         fetchLeads(),
+        fetchTasks(),
         fetchBatches(),
         fetchCampaigns(),
         fetchAppointments(),
         fetchDnd(),
         fetchAuditLogs(),
       ]);
+    }
+
+    async function fetchStatusIndicators() {
+      try {
+        const [healthRes, teleRes] = await Promise.all([
+          fetch('/api/health'),
+          fetch('/api/telephony/status'),
+        ]);
+        const health = await healthRes.json();
+        const tele = await teleRes.json();
+
+        // AI Engine Indicator
+        const aiEl = document.getElementById('ai-engine-indicator');
+        if (aiEl) {
+          if (health.simulation_mode) {
+            aiEl.className = 'status-pill';
+            aiEl.innerHTML = '🛡️ AI Engine: Simulation (Mock)';
+          } else {
+            aiEl.className = 'status-pill live';
+            aiEl.innerHTML = '<div class="pulse-dot"></div> AI Engine: Online (Live)';
+          }
+        }
+
+        // Telephony Indicator
+        const teleEl = document.getElementById('telephony-indicator');
+        if (teleEl) {
+          if (tele.simulation_mode || tele.mode === 'simulation') {
+            teleEl.className = 'status-pill';
+            teleEl.innerHTML = '🛡️ Telephony: Simulation Mode';
+          } else if (tele.verified) {
+            teleEl.className = 'status-pill live';
+            teleEl.innerHTML = `<div class="pulse-dot"></div> Telephony: Live (${(tele.active_provider || 'EXOTEL').toUpperCase()})`;
+          } else {
+            teleEl.className = 'status-pill';
+            teleEl.innerHTML = `⚠️ Telephony: Live (${(tele.active_provider || 'EXOTEL').toUpperCase()}) - Unverified`;
+          }
+        }
+      } catch (e) {
+        console.error('Status indicator fetch error:', e);
+      }
+    }
+
+    async function fetchTasks() {
+      try {
+        const res = await fetch('/api/tasks');
+        const tasks = await res.json();
+        const badge = document.getElementById('tasks-count-badge');
+        if (badge) badge.innerText = tasks.length;
+        const tbody = document.getElementById('tasks-tbody');
+        if (!tbody) return;
+        if (!tasks.length) {
+          tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: var(--text-dim);">No pending escalation tasks.</td></tr>';
+          return;
+        }
+        tbody.innerHTML = tasks.map(t => `
+          <tr>
+            <td><strong>#${t.id}</strong></td>
+            <td><strong>${escapeHtml(t.customer_name || 'Customer')}</strong></td>
+            <td>${escapeHtml(t.phone_number || '-')}</td>
+            <td><span class="badge ${t.priority === 'high' ? 'badge-hot' : 'badge-warm'}">${t.priority}</span></td>
+            <td><span class="badge badge-cold">${t.status}</span></td>
+            <td>${escapeHtml(t.assigned_to)}</td>
+            <td style="font-size: 0.75rem;">${escapeHtml(t.notes || '-')}</td>
+            <td style="font-size: 0.75rem; color: var(--text-dim);">${new Date(t.created_at).toLocaleTimeString()}</td>
+          </tr>
+        `).join('');
+      } catch (e) {
+        console.error('Tasks fetch error:', e);
+      }
+    }
+
+    // Manual Lead Modal Handlers
+    function openAddLeadModal() {
+      document.getElementById('add-lead-modal').classList.add('open');
+    }
+
+    function closeAddLeadModal() {
+      document.getElementById('add-lead-modal').classList.remove('open');
+    }
+
+    async function handleManualAddLead(event) {
+      event.preventDefault();
+      const payload = {
+        name: document.getElementById('add-lead-name').value,
+        phone_number: document.getElementById('add-lead-phone').value,
+        area: document.getElementById('add-lead-area').value,
+        bhk: document.getElementById('add-lead-bhk').value,
+        budget: document.getElementById('add-lead-budget').value,
+        notes: document.getElementById('add-lead-notes').value,
+      };
+
+      try {
+        const res = await fetch('/api/leads', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || 'Could not save lead');
+        alert(`Lead "${data.name}" successfully added to CRM!`);
+        closeAddLeadModal();
+        refreshAllData();
+      } catch (e) {
+        alert('Add Lead Error: ' + e.message);
+      }
+    }
+
+    // Recording Playback Modal Handlers
+    async function openRecordingModal(callId) {
+      const modal = document.getElementById('recording-modal');
+      const icon = document.getElementById('recording-status-icon');
+      const title = document.getElementById('recording-status-title');
+      const desc = document.getElementById('recording-status-desc');
+      const audio = document.getElementById('recording-modal-audio');
+
+      modal.classList.add('open');
+      icon.innerText = '⏳';
+      title.innerText = 'Checking Recording...';
+      desc.innerText = `Fetching call record #${callId}`;
+      audio.style.display = 'none';
+      audio.pause();
+
+      try {
+        const res = await fetch(`/api/recordings/${callId}`);
+        if (res.status === 202) {
+          const data = await res.json();
+          icon.innerText = '⏳';
+          title.innerText = 'Recording Pending';
+          desc.innerText = data.message || 'Call is active or carrier is processing recording.';
+          return;
+        }
+        if (res.status === 404) {
+          const data = await res.json();
+          icon.innerText = '📁';
+          title.innerText = 'Recording Unavailable';
+          desc.innerText = data.message || 'No audio recording found for this call.';
+          return;
+        }
+        if (res.status === 403) {
+          icon.innerText = '🔒';
+          title.innerText = 'Access Unauthorized';
+          desc.innerText = 'You do not have permission to listen to this recording.';
+          return;
+        }
+
+        const contentType = res.headers.get('content-type') || '';
+        if (contentType.includes('audio')) {
+          const blob = await res.blob();
+          audio.src = URL.createObjectURL(blob);
+          audio.style.display = 'block';
+          icon.innerText = '🎧';
+          title.innerText = 'Recording Ready';
+          desc.innerText = 'Playback fixture audio stream.';
+          audio.play().catch(() => {});
+        } else {
+          const data = await res.json();
+          if (data.recording_url || data.url) {
+            audio.src = data.recording_url || data.url;
+            audio.style.display = 'block';
+            icon.innerText = '🎧';
+            title.innerText = 'Recording Ready';
+            desc.innerText = `Duration: ${data.duration || 60} seconds`;
+            audio.play().catch(() => {});
+          } else {
+            icon.innerText = '📁';
+            title.innerText = 'Recording Unavailable';
+            desc.innerText = 'No audio stream provided.';
+          }
+        }
+      } catch (e) {
+        icon.innerText = '⚠️';
+        title.innerText = 'Playback Error';
+        desc.innerText = String(e);
+      }
+    }
+
+    function closeRecordingModal() {
+      const audio = document.getElementById('recording-modal-audio');
+      if (audio) {
+        audio.pause();
+        audio.src = '';
+      }
+      document.getElementById('recording-modal').classList.remove('open');
+    }
+
+    // Safe Simulation Call Dispatch
+    async function triggerSafeSimulationCall() {
+      const leadId = document.getElementById('studio-lead-select').value || (allLeads[0]?.id || 1);
+      const scenario = document.getElementById('sim-scenario-select').value || 'answered_hot';
+      try {
+        const res = await fetch('/api/simulation/test-call', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ lead_id: parseInt(leadId, 10), scenario }),
+        });
+        const data = await res.json();
+        alert(`Safe Simulation: ${data.scenario} — ${data.message}`);
+        refreshAllData();
+      } catch (e) {
+        alert('Simulation call error: ' + e);
+      }
     }
 
     async function fetchAnalytics() {
@@ -866,7 +1175,10 @@
               </div>
             </td>
             <td>${l.site_visit_interest ? '<span class="badge badge-confirmed">Confirmed 📅</span>' : '<span style="color: var(--text-dim);">-</span>'}</td>
-            <td><button class="btn btn-secondary btn-sm" onclick="openDossierModal(${l.id})">🔍 View Intelligence</button></td>
+            <td>
+              <button class="btn btn-secondary btn-sm" onclick="openDossierModal(${l.id})">🔍 Dossier</button>
+              <button class="btn btn-secondary btn-sm" onclick="openRecordingModal(${l.id})">🎧 Audio</button>
+            </td>
           </tr>
         `;
       }).join('');

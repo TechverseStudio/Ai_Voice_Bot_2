@@ -91,6 +91,9 @@ class CampaignEngine:
         if campaign_id in self.paused_campaigns:
             self.paused_campaigns.remove(campaign_id)
 
+        from backend.crm import create_campaign_jobs_from_contacts
+        create_campaign_jobs_from_contacts(campaign_id)
+
         self.log_event(campaign_id, "CAMPAIGN_LAUNCHED", f"Campaign '{campaign.name}' launched")
         log_audit("CAMPAIGN_STARTED", "Campaign", str(campaign_id), f"Name: {campaign.name}")
 
@@ -133,63 +136,45 @@ class CampaignEngine:
         return {"status": "stopped", "campaign_id": campaign_id}
 
     async def _process_campaign_queue(self, campaign_id: int, bypass_window_for_test: bool) -> None:
-        """Main queue-based background processing loop with concurrency and safety controls."""
+        """Main queue-based background processing loop using durable CampaignWorker."""
         try:
             campaign = get_campaign(campaign_id)
             if not campaign:
                 return
 
-            semaphore = asyncio.Semaphore(campaign.concurrency_limit or 2)
-            contacts = get_campaign_contacts(campaign_id)
+            from backend.worker import CampaignWorker
+            from backend.crm import SessionLocal, CampaignJob, select, func
+            worker = CampaignWorker(worker_id=f"engine-{campaign_id}")
 
             self.log_event(
                 campaign_id,
                 "QUEUE_INITIALIZED",
-                f"Queue initialized with {len(contacts)} contacts. Concurrency: {campaign.concurrency_limit}",
+                f"Durable queue worker initialized for Campaign '{campaign.name}'. Concurrency: {campaign.concurrency_limit}",
             )
 
-            for cc in contacts:
-                # Handle pause
-                while campaign_id in self.paused_campaigns:
-                    await asyncio.sleep(2)
+            while campaign_id not in self.paused_campaigns:
+                campaign = get_campaign(campaign_id)
+                if not campaign or campaign.status != "running":
+                    break
 
-                # Fetch fresh status
-                if cc.status in ("completed", "dnd_blocked", "max_retries_reached"):
-                    continue
+                processed = await worker.process_next_job(campaign_id=campaign_id)
+                if not processed:
+                    with SessionLocal() as s:
+                        remaining = s.scalar(
+                            select(func.count(CampaignJob.id)).where(
+                                CampaignJob.campaign_id == campaign_id,
+                                CampaignJob.status.in_(("pending", "claimed", "dispatching", "active", "retry_scheduled")),
+                            )
+                        )
+                    if not remaining:
+                        break
+                    await asyncio.sleep(0.5)
+                else:
+                    await asyncio.sleep(0.2)
 
-                # 1. Calling Window Check
-                in_window, window_msg = self.is_within_calling_window(campaign, bypass_window_for_test)
-                if not in_window:
-                    self.log_event(campaign_id, "WINDOW_RESTRICTION", window_msg)
-                    update_campaign_contact_status(
-                        cc.id,
-                        status="retry_scheduled",
-                        outcome="outside_window",
-                        next_retry=datetime.now(timezone.utc) + timedelta(minutes=60),
-                    )
-                    continue
-
-                # 2. DND & Consent Check
-                if is_phone_dnd(cc.phone_number):
-                    self.log_event(campaign_id, "DND_BLOCKED", f"Contact {cc.name} ({cc.phone_number}) blocked by DND Registry")
-                    update_campaign_contact_status(cc.id, status="dnd_blocked", outcome="dnd_opt_out")
-                    continue
-
-                # 3. Maximum Attempts Check
-                if cc.attempts >= campaign.max_attempts:
-                    self.log_event(campaign_id, "MAX_RETRIES", f"Contact {cc.name} reached max attempts ({campaign.max_attempts})")
-                    update_campaign_contact_status(cc.id, status="max_retries_reached", outcome="unreachable")
-                    continue
-
-                # 4. Process Call with Semaphore Concurrency Control
-                async with semaphore:
-                    await self._execute_autonomous_call(campaign, cc)
-
-                # Rate limiting delay between calls (1-2 seconds)
-                await asyncio.sleep(1.5)
-
-            update_campaign_status(campaign_id, "completed")
-            self.log_event(campaign_id, "CAMPAIGN_COMPLETED", f"All eligible contacts in campaign {campaign_id} processed")
+            if campaign_id not in self.paused_campaigns:
+                update_campaign_status(campaign_id, "completed")
+                self.log_event(campaign_id, "CAMPAIGN_COMPLETED", f"All eligible contacts in campaign {campaign_id} processed")
 
         except asyncio.CancelledError:
             self.log_event(campaign_id, "CAMPAIGN_CANCELLED", "Queue processor task cancelled")

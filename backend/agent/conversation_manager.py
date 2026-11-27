@@ -204,6 +204,16 @@ class ConversationManager:
             session.history.append({"role": "assistant", "content": response})
             return response, intent, session.facts_collected
 
+        if intent == "human_escalation":
+            session.is_concluded = True
+            session.facts_collected["human_escalation_requested"] = True
+            response = (
+                "Certainly! I have scheduled an immediate high-priority follow-up with our senior property specialist desk. "
+                "They will reach out to you directly with detailed floor plans and assistance. Thank you!"
+            )
+            session.history.append({"role": "assistant", "content": response})
+            return response, intent, session.facts_collected
+
         if intent == "callback_requested":
             session.is_concluded = True
             response = (
@@ -296,6 +306,8 @@ class ConversationManager:
     def _detect_intent(self, session: ConversationSession, lowered: str) -> str:
         if any(w in lowered for w in ("do not call", "don't call", "stop calling", "remove my number", "block me")):
             return "do_not_call"
+        if any(w in lowered for w in ("talk to a human", "speak to a human", "speak to a person", "talk to a person", "real person", "human agent", "talk to human", "speak with human", "human please", "connect to agent", "connect to manager", "sales manager", "human representative")):
+            return "human_escalation"
         if any(w in lowered for w in ("call me back", "call later", "busy right now", "in a meeting", "driving")):
             return "callback_requested"
         if any(w in lowered for w in ("not interested", "no need", "wrong number", "already bought")):
@@ -318,6 +330,10 @@ class ConversationManager:
 
     def _generate_llm_response(self, session: ConversationSession, customer_speech: str, intent: str) -> str:
         """Call Sarvam LLM for natural, human-like sales conversation, with robust grounded fallback."""
+        is_simulation = os.getenv("SIMULATION_MODE", "true").lower() in ("true", "1", "yes")
+        if is_simulation or not SARVAM_API_KEY or SARVAM_API_KEY.startswith("mock"):
+            return self._generate_grounded_fallback(session, intent)
+
         system_prompt = "You are " + session.agent_name + ", real estate sales specialist for Krishna Property Wakad. Customer: " + session.customer_name + ". Rules: 1-3 spoken sentences. Ask ONE question. Ground in project facts: 1 BHK 48L, 2 BHK 72L, 3 BHK 98L, clubhouse, gym, pool, Wakad Hinjawadi link road. Offer site visit this Saturday 11 AM if interested."
         messages = [{"role": "system", "content": system_prompt}]
         for msg in session.history[-6:]:

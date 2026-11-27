@@ -1,7 +1,7 @@
 """Database models and persistence layer for AI Autonomous Lead Generation Engine."""
 
 from ast import literal_eval
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import re
@@ -20,12 +20,19 @@ from sqlalchemy import (
     create_engine,
     select,
     update,
+    delete,
     func,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 from sklearn.feature_extraction.text import TfidfVectorizer
 
-from backend.config import DATABASE_URL
+from backend.config import (
+    DATABASE_URL,
+    DB_POOL_SIZE,
+    DB_MAX_OVERFLOW,
+    DB_POOL_RECYCLE,
+    DB_POOL_TIMEOUT,
+)
 
 
 class Base(DeclarativeBase):
@@ -289,11 +296,110 @@ class DndEntry(Base):
     )
 
 
+class FollowUpTask(Base):
+    """CRM task generated when caller asks for human escalation or manual follow-up."""
+    __tablename__ = "follow_up_tasks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    lead_id: Mapped[int | None] = mapped_column(Integer, index=True, nullable=True)
+    campaign_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    customer_name: Mapped[str] = mapped_column(String(120), default="")
+    phone_number: Mapped[str] = mapped_column(String(40), default="")
+    task_type: Mapped[str] = mapped_column(String(60), default="human_escalation")
+    priority: Mapped[str] = mapped_column(String(30), default="high")
+    status: Mapped[str] = mapped_column(String(30), default="pending")  # pending, completed, cancelled
+    assigned_to: Mapped[str] = mapped_column(String(120), default="Senior Property Specialist")
+    notes: Mapped[str] = mapped_column(Text, default="")
+    due_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+
+class CampaignJob(Base):
+    """Durable relational job for queue-based autonomous outbound calling."""
+    __tablename__ = "campaign_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    campaign_id: Mapped[int] = mapped_column(Integer, index=True)
+    contact_id: Mapped[int] = mapped_column(Integer, index=True)
+    lead_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    phone_number: Mapped[str] = mapped_column(String(40), index=True)
+    customer_name: Mapped[str] = mapped_column(String(120), default="")
+    locality: Mapped[str] = mapped_column(String(120), default="")
+    
+    # State machine: pending -> claimed -> dispatching -> active -> completed / failed / retry_scheduled / dnd_blocked
+    status: Mapped[str] = mapped_column(String(30), default="pending", index=True)
+    attempt: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=2)
+    
+    # Worker lease & lock
+    claimed_by_worker: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    
+    # Carrier tracking
+    provider_call_id: Mapped[str | None] = mapped_column(String(100), index=True, nullable=True)
+    session_id: Mapped[str | None] = mapped_column(String(100), index=True, nullable=True)
+    
+    # Scheduling & Retries
+    scheduled_for: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    outcome: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+
+class ActiveCallChannel(Base):
+    """Holds active channel reservation to enforce carrier concurrency limits."""
+    __tablename__ = "active_call_channels"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    campaign_id: Mapped[int] = mapped_column(Integer, index=True)
+    job_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
+    provider_call_id: Mapped[str | None] = mapped_column(String(100), index=True, nullable=True)
+    phone_number: Mapped[str] = mapped_column(String(40))
+    status: Mapped[str] = mapped_column(String(30), default="reserved")  # reserved, dialing, connected
+    reserved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
 engine_options = {"pool_pre_ping": True}
 if DATABASE_URL.startswith("sqlite"):
     engine_options["connect_args"] = {"check_same_thread": False}
+elif DATABASE_URL.startswith("postgresql"):
+    engine_options.update({
+        "pool_size": DB_POOL_SIZE,
+        "max_overflow": DB_MAX_OVERFLOW,
+        "pool_recycle": DB_POOL_RECYCLE,
+        "pool_timeout": DB_POOL_TIMEOUT,
+    })
+
 engine = create_engine(DATABASE_URL, **engine_options)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+
+
+def reset_engine(new_database_url: str) -> None:
+    """Helper to rebind engine and sessionmaker to a new database (e.g. for PostgreSQL migrations)."""
+    global engine, SessionLocal
+    opts = {"pool_pre_ping": True}
+    if new_database_url.startswith("sqlite"):
+        opts["connect_args"] = {"check_same_thread": False}
+    elif new_database_url.startswith("postgresql"):
+        opts.update({
+            "pool_size": DB_POOL_SIZE,
+            "max_overflow": DB_MAX_OVERFLOW,
+            "pool_recycle": DB_POOL_RECYCLE,
+            "pool_timeout": DB_POOL_TIMEOUT,
+        })
+    engine = create_engine(new_database_url, **opts)
+    SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
 
 def create_tables() -> None:
@@ -591,6 +697,39 @@ def update_campaign_contact_status(
             session.commit()
 
 
+def update_campaign_contact_by_session(
+    session_id: str,
+    status: str,
+    outcome: str = "",
+    lead_id: int | None = None,
+    overwrite_completed: bool = False,
+) -> CampaignContact | None:
+    """Update a CampaignContact row identified by its provider call SID / session ID."""
+    if not session_id:
+        return None
+    with SessionLocal() as session:
+        cc = session.scalar(
+            select(CampaignContact).where(CampaignContact.call_session_id == session_id)
+        )
+        if not cc:
+            return None
+        if cc.status == "completed" and not overwrite_completed:
+            if lead_id and not cc.lead_id:
+                cc.lead_id = lead_id
+                session.commit()
+                session.refresh(cc)
+            return cc
+        cc.status = status
+        cc.last_call_at = datetime.now(timezone.utc)
+        if outcome:
+            cc.call_outcome = outcome
+        if lead_id:
+            cc.lead_id = lead_id
+        session.commit()
+        session.refresh(cc)
+        return cc
+
+
 # --- Lead & CRM Helpers ---
 
 def get_leads() -> list[Lead]:
@@ -705,6 +844,10 @@ def create_or_update_lead(
                 lead.next_action = next_action
             if assigned_salesperson:
                 lead.assigned_salesperson = assigned_salesperson
+            if campaign_id is not None:
+                lead.campaign_id = campaign_id
+            if contact_id is not None:
+                lead.contact_id = contact_id
             if opt_out:
                 lead.opt_out = True
             lead.updated_at = datetime.now(timezone.utc)
@@ -838,6 +981,16 @@ def get_outbound_calls(campaign_id: int | None = None, lead_id: int | None = Non
         if lead_id is not None:
             stmt = stmt.where(OutboundCall.lead_id == lead_id)
         return list(session.scalars(stmt.order_by(OutboundCall.created_at.desc())))
+
+
+def get_outbound_call_by_sid(provider_call_id: str) -> OutboundCall | None:
+    """Fetch a single OutboundCall record by its provider CallSid."""
+    if not provider_call_id:
+        return None
+    with SessionLocal() as session:
+        return session.scalar(
+            select(OutboundCall).where(OutboundCall.provider_call_id == provider_call_id)
+        )
 
 
 # --- Browser Sessions ---
@@ -1154,3 +1307,324 @@ class KnowledgeBase:
         scores = (self.vectorizer.transform([question]) @ self.matrix.T).toarray()[0]
         indexes = scores.argsort()[::-1][:limit]
         return "\n\n".join(self.documents[index] for index in indexes if scores[index] > 0)
+
+
+# ==========================================
+# Human Escalation Follow-Up Tasks
+# ==========================================
+
+def create_follow_up_task(
+    lead_id: int | None = None,
+    campaign_id: int | None = None,
+    customer_name: str = "",
+    phone_number: str = "",
+    task_type: str = "human_escalation",
+    priority: str = "high",
+    notes: str = "",
+    assigned_to: str = "Senior Property Specialist",
+    due_date: datetime | None = None,
+) -> FollowUpTask:
+    with SessionLocal() as session:
+        task = FollowUpTask(
+            lead_id=lead_id,
+            campaign_id=campaign_id,
+            customer_name=customer_name,
+            phone_number=phone_number,
+            task_type=task_type,
+            priority=priority,
+            status="pending",
+            assigned_to=assigned_to,
+            notes=notes,
+            due_date=due_date,
+        )
+        session.add(task)
+        session.commit()
+        session.refresh(task)
+        return task
+
+
+def get_follow_up_tasks(status: str | None = None, lead_id: int | None = None) -> list[FollowUpTask]:
+    with SessionLocal() as session:
+        stmt = select(FollowUpTask)
+        if status:
+            stmt = stmt.where(FollowUpTask.status == status)
+        if lead_id:
+            stmt = stmt.where(FollowUpTask.lead_id == lead_id)
+        stmt = stmt.order_by(FollowUpTask.id.desc())
+        return list(session.scalars(stmt))
+
+
+def update_follow_up_task_status(task_id: int, status: str, notes: str = "") -> FollowUpTask | None:
+    with SessionLocal() as session:
+        task = session.get(FollowUpTask, task_id)
+        if not task:
+            return None
+        task.status = status
+        if notes:
+            task.notes = (task.notes + "\n" + notes).strip()
+        session.commit()
+        session.refresh(task)
+        return task
+
+
+# ==========================================
+# Durable Campaign Job Queue Operations
+# ==========================================
+
+def create_campaign_jobs_from_contacts(campaign_id: int) -> int:
+    """Populate campaign_jobs table from campaign_contacts."""
+    with SessionLocal() as session:
+        campaign = session.get(Campaign, campaign_id)
+        if not campaign:
+            return 0
+        contacts = list(session.scalars(select(CampaignContact).where(CampaignContact.campaign_id == campaign_id)))
+        created_count = 0
+        now = datetime.now(timezone.utc)
+        for cc in contacts:
+            existing = session.scalar(
+                select(CampaignJob).where(
+                    CampaignJob.campaign_id == campaign_id,
+                    CampaignJob.contact_id == cc.id,
+                )
+            )
+            if not existing:
+                job = CampaignJob(
+                    campaign_id=campaign_id,
+                    contact_id=cc.id,
+                    phone_number=cc.phone_number,
+                    customer_name=cc.name or "Prospective Buyer",
+                    locality=cc.locality or "",
+                    status="pending" if cc.status not in ("completed", "dnd_blocked") else cc.status,
+                    attempt=cc.attempts or 0,
+                    max_attempts=campaign.max_attempts or 2,
+                    scheduled_for=now,
+                )
+                session.add(job)
+                created_count += 1
+        session.commit()
+        return created_count
+
+
+def claim_next_campaign_job(
+    worker_id: str,
+    campaign_id: int | None = None,
+    lease_seconds: int = 120,
+) -> CampaignJob | None:
+    """Atomically claim the next eligible campaign job using database locking."""
+    now = datetime.now(timezone.utc)
+    lease_exp = now + timedelta(seconds=lease_seconds)
+
+    with SessionLocal() as session:
+        if campaign_id:
+            camp = session.get(Campaign, campaign_id)
+            if not camp or camp.status != "running":
+                return None
+
+        stmt = (
+            select(CampaignJob)
+            .where(
+                (
+                    (CampaignJob.status == "pending")
+                    & (CampaignJob.scheduled_for <= now)
+                )
+                | (
+                    (CampaignJob.status.in_(("claimed", "dispatching")))
+                    & (CampaignJob.lease_expires_at < now)
+                )
+            )
+        )
+        if campaign_id:
+            stmt = stmt.where(CampaignJob.campaign_id == campaign_id)
+        else:
+            running_campaign_ids = select(Campaign.id).where(Campaign.status == "running")
+            stmt = stmt.where(CampaignJob.campaign_id.in_(running_campaign_ids))
+
+        stmt = stmt.order_by(CampaignJob.scheduled_for.asc(), CampaignJob.id.asc()).limit(1)
+
+        if session.bind.dialect.name == "postgresql":
+            stmt = stmt.with_for_update(skip_locked=True)
+
+        job = session.scalar(stmt)
+        if not job:
+            return None
+
+        job.status = "claimed"
+        job.claimed_by_worker = worker_id
+        job.claimed_at = now
+        job.lease_expires_at = lease_exp
+        session.commit()
+        session.refresh(job)
+        return job
+
+
+def get_active_channel_count(campaign_id: int) -> int:
+    """Get active channel count reserved for a campaign."""
+    now = datetime.now(timezone.utc)
+    with SessionLocal() as session:
+        return session.scalar(
+            select(func.count(ActiveCallChannel.id)).where(
+                ActiveCallChannel.campaign_id == campaign_id,
+                ActiveCallChannel.expires_at > now,
+            )
+        ) or 0
+
+
+def reserve_channel_capacity(
+    campaign_id: int,
+    job_id: int,
+    phone_number: str,
+    timeout_seconds: int = 600,
+) -> ActiveCallChannel | None:
+    """Reserve a channel slot before dispatch if within campaign concurrency limit."""
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(seconds=timeout_seconds)
+
+    with SessionLocal() as session:
+        campaign = session.get(Campaign, campaign_id)
+        if not campaign:
+            return None
+        limit = campaign.concurrency_limit or 2
+
+        current_count = session.scalar(
+            select(func.count(ActiveCallChannel.id)).where(
+                ActiveCallChannel.campaign_id == campaign_id,
+                ActiveCallChannel.expires_at > now,
+            )
+        ) or 0
+
+        if current_count >= limit:
+            return None
+
+        existing = session.scalar(select(ActiveCallChannel).where(ActiveCallChannel.job_id == job_id))
+        if existing:
+            existing.expires_at = expires
+            session.commit()
+            session.refresh(existing)
+            return existing
+
+        channel = ActiveCallChannel(
+            campaign_id=campaign_id,
+            job_id=job_id,
+            phone_number=phone_number,
+            status="reserved",
+            reserved_at=now,
+            expires_at=expires,
+        )
+        session.add(channel)
+        session.commit()
+        session.refresh(channel)
+        return channel
+
+
+def release_channel_capacity(job_id: int | None = None, provider_call_id: str | None = None) -> bool:
+    """Idempotently release a reserved call channel upon terminal event or timeout."""
+    with SessionLocal() as session:
+        stmt = delete(ActiveCallChannel)
+        if job_id is not None:
+            stmt = stmt.where(ActiveCallChannel.job_id == job_id)
+        elif provider_call_id is not None:
+            stmt = stmt.where(ActiveCallChannel.provider_call_id == provider_call_id)
+        else:
+            return False
+        session.execute(stmt)
+        session.commit()
+        return True
+
+
+def reconcile_expired_channels() -> int:
+    """Clean up expired channel reservations (safety reconciliation)."""
+    now = datetime.now(timezone.utc)
+    with SessionLocal() as session:
+        result = session.execute(delete(ActiveCallChannel).where(ActiveCallChannel.expires_at <= now))
+        session.commit()
+        return result.rowcount or 0
+
+
+def recover_stale_jobs(worker_id: str | None = None) -> int:
+    """Recover jobs left in claimed or dispatching status past lease expiration."""
+    now = datetime.now(timezone.utc)
+    with SessionLocal() as session:
+        stmt = (
+            update(CampaignJob)
+            .where(
+                CampaignJob.status.in_(("claimed", "dispatching")),
+                CampaignJob.lease_expires_at < now,
+            )
+            .values(
+                status="pending",
+                claimed_by_worker=None,
+                claimed_at=None,
+                lease_expires_at=None,
+            )
+        )
+        result = session.execute(stmt)
+        session.commit()
+        return result.rowcount or 0
+
+
+def get_campaign_job(job_id: int) -> CampaignJob | None:
+    with SessionLocal() as session:
+        return session.get(CampaignJob, job_id)
+
+
+def get_campaign_job_by_session(session_id: str) -> CampaignJob | None:
+    with SessionLocal() as session:
+        return session.scalar(
+            select(CampaignJob).where(
+                (CampaignJob.session_id == session_id) | (CampaignJob.provider_call_id == session_id)
+            )
+        )
+
+
+def update_job_status(
+    job_id: int,
+    status: str,
+    outcome: str | None = None,
+    provider_call_id: str | None = None,
+    session_id: str | None = None,
+    last_error: str | None = None,
+    next_scheduled_for: datetime | None = None,
+) -> CampaignJob | None:
+    with SessionLocal() as session:
+        job = session.get(CampaignJob, job_id)
+        if not job:
+            return None
+
+        # Terminal guard: Once terminal, do not regress to active/claimed
+        if job.status in ("completed", "dnd_blocked") and status not in ("completed", "dnd_blocked"):
+            return job
+
+        job.status = status
+        if outcome is not None:
+            job.outcome = outcome
+        if provider_call_id is not None:
+            job.provider_call_id = provider_call_id
+        if session_id is not None:
+            job.session_id = session_id
+        if last_error is not None:
+            job.last_error = last_error
+        if next_scheduled_for is not None:
+            job.scheduled_for = next_scheduled_for
+
+        if status in ("completed", "failed", "dnd_blocked", "max_retries_reached"):
+            job.claimed_by_worker = None
+            job.lease_expires_at = None
+
+        session.commit()
+        session.refresh(job)
+
+        # Sync back to CampaignContact
+        cc = session.get(CampaignContact, job.contact_id)
+        if cc:
+            cc.status = status if status != "dnd_blocked" else "dnd_blocked"
+            if outcome:
+                cc.call_outcome = outcome
+            if job.provider_call_id:
+                cc.session_id = job.provider_call_id
+            session.commit()
+
+        if status in ("completed", "failed", "dnd_blocked", "max_retries_reached"):
+            release_channel_capacity(job_id=job.id)
+
+        return job
+

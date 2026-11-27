@@ -85,14 +85,24 @@ class ExotelProvider(BaseTelephonyProvider):
         api_url = f"{base_url}/v1/Accounts/{account_sid}/Calls/connect.json"
 
         # Determine Flow URL / Voicebot Endpoint
-        agent_url = os.getenv("AGENTSTREAM_PUBLIC_URL") or AGENTSTREAM_PUBLIC_URL or os.getenv("PUBLIC_BASE_URL") or ""
-        applet_id = os.getenv("EXOTEL_APPLET_ID") or EXOTEL_APPLET_ID
+        # Exotel Calls/connect requires the App Bazaar ExoML flow URL when an applet ID is configured;
+        # the Voicebot Applet inside that flow then queries our dynamic voicebot-endpoint.
+        agent_url = (
+            os.environ["AGENTSTREAM_PUBLIC_URL"].strip()
+            if "AGENTSTREAM_PUBLIC_URL" in os.environ
+            else (AGENTSTREAM_PUBLIC_URL or os.getenv("PUBLIC_BASE_URL") or "").strip()
+        )
+        applet_id = (
+            os.environ["EXOTEL_APPLET_ID"].strip()
+            if "EXOTEL_APPLET_ID" in os.environ
+            else (EXOTEL_APPLET_ID or "").strip()
+        )
 
         flow_url = ""
-        if agent_url:
-            flow_url = f"{agent_url.rstrip('/')}/api/telephony/exotel/voicebot-endpoint"
-        elif applet_id:
+        if applet_id:
             flow_url = f"https://my.exotel.com/{account_sid}/exoml/start_voice/{applet_id}"
+        elif agent_url:
+            flow_url = f"{agent_url.rstrip('/')}/api/telephony/exotel/voicebot-endpoint"
         else:
             flow_url = f"{base_url}/v1/Accounts/{account_sid}/default_flow"
 

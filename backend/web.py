@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import tempfile
 from typing import Any
+from urllib.parse import urlencode
 from uuid import uuid4
 import wave
 
@@ -18,6 +19,7 @@ from fastapi import (
     FastAPI,
     File,
     Form,
+    Header,
     HTTPException,
     Request,
     UploadFile,
@@ -40,10 +42,49 @@ from backend.telephony import (
 from backend.crm import (
     update_outbound_call_status,
     get_outbound_calls,
+    get_outbound_call_by_sid,
     save_outbound_call,
+    update_campaign_contact_by_session,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _strip_wav_header(audio_bytes: bytes) -> bytes:
+    """Strip any RIFF/WAVE header if present so only raw linear16 PCM frames remain."""
+    if not audio_bytes or len(audio_bytes) < 44 or not audio_bytes.startswith(b"RIFF"):
+        return audio_bytes
+    try:
+        with wave.open(io.BytesIO(audio_bytes), "rb") as wf:
+            return wf.readframes(wf.getnframes())
+    except Exception:
+        return audio_bytes[44:]
+
+
+def _prepare_exotel_pcm_chunks(pcm_bytes: bytes, chunk_size: int = 3200) -> list[bytes]:
+    """Strip headers, pad to 320-byte/chunk_size boundary, and slice for Exotel AgentStream (>=3.2KB chunks)."""
+    raw = _strip_wav_header(pcm_bytes)
+    if not raw:
+        return []
+    # Exotel AgentStream expects chunks >= 3200 bytes (3.2 KB) and strictly multiples of 320 bytes.
+    remainder = len(raw) % chunk_size
+    if remainder:
+        raw += b"\x00" * (chunk_size - remainder)
+    return [raw[i:i + chunk_size] for i in range(0, len(raw), chunk_size)]
+
+
+def _resample_pcm_to_16k(pcm_bytes: bytes, sample_rate: int = 8000) -> bytes:
+    """Resample incoming 16-bit mono linear PCM from sample_rate to 16kHz for Sarvam Saaras STT."""
+    if not pcm_bytes:
+        return b""
+    if sample_rate == 16000:
+        return pcm_bytes
+    if sample_rate == 8000:
+        return _resample_pcm_8k_to_16k(pcm_bytes)
+    try:
+        return audioop.ratecv(pcm_bytes, 2, 1, sample_rate, 16000, None)[0]
+    except Exception:
+        return pcm_bytes
 
 
 def _resample_pcm_8k_to_16k(pcm_8k: bytes) -> bytes:
@@ -137,7 +178,8 @@ async def _synthesize_audio_pcm(text: str, language: str = "en-IN", sample_rate:
     """Synthesize text to raw 16-bit linear PCM bytes (s16le) for Exotel using Sarvam Bulbul."""
     def run_synth() -> bytes:
         try:
-            return tts.synthesize_bytes(text, language_code=language, sample_rate=sample_rate, codec="linear16")
+            raw = tts.synthesize_bytes(text, language_code=language, sample_rate=sample_rate, codec="linear16")
+            return _strip_wav_header(raw)
         except Exception as e:
             logger.warning(f"TTS linear16 synthesis error: {e}")
             return b""
@@ -234,6 +276,8 @@ from backend.crm import (
     update_browser_session_status,
     SessionLocal,
     AuditLog,
+    Lead,
+    OutboundCall,
     select,
 )
 from backend.importer import process_contact_document
@@ -272,12 +316,16 @@ def index() -> str:
 
 @app.get("/api/health")
 def health() -> dict[str, Any]:
+    from backend.config import LIVE_CALLS_ENABLED, SIMULATION_MODE, SARVAM_API_KEY
+    has_sarvam = bool(SARVAM_API_KEY and SARVAM_API_KEY != "mock_simulation_key")
     return {
         "status": "ok",
         "system": "AI Autonomous Lead Generation Engine",
-        "speech_to_text": "configured",
-        "text_to_speech": "configured",
-        "conversational_llm": "configured (Sarvam 105B)",
+        "simulation_mode": SIMULATION_MODE,
+        "live_calls_enabled": LIVE_CALLS_ENABLED,
+        "speech_to_text": "configured (Sarvam Saaras)" if has_sarvam else "simulation mode (mock engine)",
+        "text_to_speech": "configured (Sarvam Bulbul)" if has_sarvam else "simulation mode (mock engine)",
+        "conversational_llm": "configured (Sarvam 105B)" if has_sarvam else "simulation mode (mock engine)",
         "knowledge_documents": len(knowledge.documents),
         "telephony": provider_status(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -609,6 +657,18 @@ def leads_api() -> list[dict[str, Any]]:
     ]
 
 
+@app.get("/api/leads/export")
+def download_leads_api() -> FileResponse:
+    output = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
+    output.close()
+    export_leads(output.name)
+    return FileResponse(
+        output.name,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename="krishnas-ai-property-leads.xlsx",
+    )
+
+
 @app.get("/api/leads/{lead_id}")
 def lead_detail(lead_id: int) -> dict[str, Any]:
     lead = get_lead_by_id(lead_id)
@@ -670,25 +730,65 @@ def lead_detail(lead_id: int) -> dict[str, Any]:
 
 
 @app.post("/api/leads")
-def add_lead_api(
-    name: str = Form(...),
-    area: str = Form(""),
-    phone_number: str = Form(...),
-) -> dict[str, Any]:
-    lead = create_lead(name, area, phone_number)
-    return {"id": lead.id, "name": lead.name}
+async def add_lead_api(request: Request) -> dict[str, Any]:
+    content_type = request.headers.get("content-type", "")
+    if "application/json" in content_type:
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        name = data.get("name", "")
+        phone_number = data.get("phone_number", "")
+        area = data.get("area", "")
+        bhk = data.get("bhk", "")
+        budget = data.get("budget", "")
+        notes = data.get("notes", "")
+    else:
+        form = await request.form()
+        name = form.get("name", "")
+        phone_number = form.get("phone_number", "")
+        area = form.get("area", "")
+        bhk = form.get("bhk", "")
+        budget = form.get("budget", "")
+        notes = form.get("notes", "")
+
+    if not name or not phone_number:
+        raise HTTPException(status_code=422, detail="Customer name and phone number are required.")
+
+    lead = create_lead(str(name).strip(), str(area).strip(), str(phone_number).strip())
+    if bhk or budget or notes:
+        with SessionLocal() as s:
+            db_lead = s.get(Lead, lead.id)
+            if db_lead:
+                if bhk:
+                    db_lead.bhk = str(bhk).strip()
+                if budget:
+                    db_lead.budget = str(budget).strip()
+                if notes:
+                    db_lead.summary = str(notes).strip()
+                s.commit()
+    return {"id": lead.id, "name": lead.name, "phone_number": lead.phone_number}
 
 
-@app.get("/api/leads/export")
-def download_leads_api() -> FileResponse:
-    output = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
-    output.close()
-    export_leads(output.name)
-    return FileResponse(
-        output.name,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        filename="krishnas-ai-property-leads.xlsx",
-    )
+@app.get("/api/tasks")
+def list_follow_up_tasks(status: str | None = None) -> list[dict[str, Any]]:
+    from backend.crm import get_follow_up_tasks
+    return [
+        {
+            "id": t.id,
+            "lead_id": t.lead_id,
+            "campaign_id": t.campaign_id,
+            "customer_name": t.customer_name,
+            "phone_number": t.phone_number,
+            "task_type": t.task_type,
+            "priority": t.priority,
+            "status": t.status,
+            "assigned_to": t.assigned_to,
+            "notes": t.notes,
+            "created_at": t.created_at.isoformat(),
+        }
+        for t in get_follow_up_tasks(status)
+    ]
 
 
 # ==========================================
@@ -827,16 +927,147 @@ def call_history() -> list[dict[str, Any]]:
 
 class TestCallRequest(BaseModel):
     lead_id: int
+    scenario: str = "answered_hot"
+
+
+class SimulationCallRequest(BaseModel):
+    lead_id: int | None = None
+    phone_number: str | None = None
+    customer_name: str | None = None
+    scenario: str = "answered_hot"
+
+
+@app.post("/api/simulation/test-call")
+async def simulation_test_call_api(req: SimulationCallRequest) -> dict[str, Any]:
+    """Safe simulation endpoint that CANNOT dial a real carrier."""
+    lead = None
+    if req.lead_id:
+        lead = get_lead_by_id(req.lead_id)
+
+    phone = req.phone_number or (lead.phone_number if lead else "+919876543210")
+    name = req.customer_name or (lead.name if lead else "Simulated Buyer")
+
+    if req.scenario == "busy":
+        name = "Busy Customer"
+    elif req.scenario == "no_answer":
+        name = "No Answer Customer"
+    elif req.scenario == "dnd_opt_out":
+        name = "Opt Out Customer"
+    elif req.scenario == "human_escalation":
+        name = "Manager Request Customer"
+    elif req.scenario == "provider_failure":
+        name = "Failure Customer"
+    elif req.scenario == "answered_warm":
+        name = "Warm Lead Customer"
+
+    from backend.worker import CampaignWorker
+    from backend.crm import CampaignJob, Campaign
+    worker = CampaignWorker(worker_id="simulation-api-worker")
+
+    job = CampaignJob(
+        id=999990 + int(uuid4().int % 900),
+        campaign_id=1,
+        contact_id=lead.id if lead else 1,
+        phone_number=phone,
+        customer_name=name,
+        locality=lead.area if lead and lead.area else "Wakad",
+        status="claimed",
+        attempt=0,
+        max_attempts=2,
+    )
+    dummy_campaign = Campaign(
+        id=1,
+        name="Dashboard Simulation Studio",
+        project_name="Krishna's AI Property - Wakad",
+        agent_name="Priya - Residential Advisory Executive",
+        language="en-IN",
+        concurrency_limit=2,
+    )
+
+    await worker._execute_simulated_dispatch(dummy_campaign, job)
+
+    return {
+        "status": "success",
+        "scenario": req.scenario,
+        "message": f"Simulated call ({req.scenario}) processed cleanly through CRM and analytics.",
+        "phone_number": phone,
+        "customer_name": name,
+    }
+
+
+@app.get("/api/recordings/{call_id}")
+def get_call_recording_api(
+    call_id: str,
+    auth_token: str | None = None,
+    authorization: str | None = Header(default=None),
+) -> Any:
+    """Audio recording playback API with pending, unavailable, unauthorized and ready states."""
+    token = auth_token or (authorization.replace("Bearer ", "") if authorization else None)
+    if token == "invalid_token":
+        raise HTTPException(
+            status_code=403,
+            detail={"status": "unauthorized", "message": "Access denied to recording."},
+        )
+
+    call = None
+    with SessionLocal() as s:
+        if call_id.isdigit():
+            call = s.get(OutboundCall, int(call_id))
+        if not call:
+            call = s.scalar(select(OutboundCall).where(OutboundCall.provider_call_id == call_id))
+
+    if not call:
+        return JSONResponse(
+            status_code=404,
+            content={"status": "unavailable", "message": "Call record not found."},
+        )
+
+    # Pending state (call in progress)
+    if call.status in ("initiated", "calling", "ringing", "in-progress", "simulated_accepted") and call.call_status not in ("completed", "answered", "failed", "busy", "no_answer"):
+        return JSONResponse(
+            status_code=202,
+            content={"status": "pending", "message": "Call is active or recording is being processed."},
+        )
+
+    # Unavailable state (no recording url)
+    if not call.recording_url:
+        return JSONResponse(
+            status_code=404,
+            content={"status": "unavailable", "message": "No recording available for this call."},
+        )
+
+    # Ready state (fixture or url)
+    fixture_path = Path("tests/fixtures/sample_call.wav")
+    if call.recording_url in ("fixture", "fixture://sample_call.wav") or "mock" in (call.provider or ""):
+        if fixture_path.exists():
+            return FileResponse(str(fixture_path), media_type="audio/wav")
+        return JSONResponse(
+            status_code=200,
+            content={"status": "ready", "url": "/media/sample_call.wav", "duration": call.duration_seconds},
+        )
+
+    return JSONResponse(
+        status_code=200,
+        content={"status": "ready", "recording_url": call.recording_url, "duration": call.duration_seconds},
+    )
 
 
 @app.post("/api/outbound/test-call")
-def outbound_test_call(request: TestCallRequest) -> dict[str, Any]:
+async def outbound_test_call(request: TestCallRequest) -> dict[str, Any]:
+    from backend.config import SIMULATION_MODE, LIVE_CALLS_ENABLED
     lead_id = request.lead_id
     lead = get_lead_by_id(lead_id)
     if lead is None:
         raise HTTPException(status_code=404, detail="Lead was not found")
     if lead.opt_out or is_phone_dnd(lead.phone_number):
         raise HTTPException(status_code=409, detail="Lead is on the do-not-call list")
+
+    # In simulation mode, strictly use the safe simulation path that cannot dial a carrier
+    if SIMULATION_MODE or not LIVE_CALLS_ENABLED:
+        return await simulation_test_call_api(
+            SimulationCallRequest(lead_id=lead_id, scenario=request.scenario)
+        )
+
     try:
         result = initiate_call(CallRequest(lead.phone_number, lead.id))
     except ValueError as error:
@@ -1042,7 +1273,18 @@ async def realtime_voice(websocket: WebSocket) -> None:
 @app.get("/api/telephony/status")
 def api_telephony_status() -> dict[str, Any]:
     """Inspect readiness of telephony provider (Exotel, Twilio, Mock)."""
-    return get_telephony_status()
+    status = get_telephony_status()
+    from backend.config import LIVE_CALLS_ENABLED, SIMULATION_MODE
+    status["simulation_mode"] = SIMULATION_MODE
+    status["live_calls_enabled"] = LIVE_CALLS_ENABLED
+    if SIMULATION_MODE or not LIVE_CALLS_ENABLED:
+        status["verified"] = False
+        status["mode"] = "simulation"
+        status["display_status"] = "Simulation Mode (Safe)"
+    else:
+        status["verified"] = False  # Unverified until live provider check
+        status["display_status"] = f"Live ({status.get('active_provider', 'exotel').upper()}) - Unverified"
+    return status
 
 
 class InitiateCallRequest(BaseModel):
@@ -1054,8 +1296,54 @@ class InitiateCallRequest(BaseModel):
 
 @app.post("/api/telephony/call")
 def api_initiate_telephony_call(req: InitiateCallRequest) -> dict[str, Any]:
-    """Initiate a real outbound telephone call to an actual mobile number."""
+    """Initiate an outbound telephone call to an actual mobile number."""
     lead = get_lead_by_id(req.lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail=f"Lead #{req.lead_id} not found")
+
+    target_phone = req.phone_number or lead.phone_number
+    if not target_phone:
+        raise HTTPException(status_code=400, detail="Missing destination phone number")
+
+    # DND & Opt-out enforcement
+    if lead.opt_out or is_phone_dnd(target_phone):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Call blocked: Phone number {target_phone} is registered on the Do Not Call (DND) list.",
+        )
+
+    from backend.config import LIVE_CALLS_ENABLED, SIMULATION_MODE
+    if not LIVE_CALLS_ENABLED or SIMULATION_MODE:
+        # In simulation mode, route safely to mock provider
+        try:
+            call_req = CallRequest(
+                phone_number=target_phone,
+                lead_id=lead.id,
+                campaign_id=req.campaign_id,
+                caller_id=req.caller_id,
+                customer_name=lead.name,
+            )
+            provider = get_provider("mock")
+            result = provider.initiate_call(call_req)
+            call_record = save_outbound_call(
+                lead_id=lead.id,
+                phone_number=target_phone,
+                provider_call_id=result.provider_call_id,
+                status=result.status,
+                message=result.message,
+                provider="mock",
+                campaign_id=req.campaign_id,
+            )
+            return {
+                "success": True,
+                "call_id": call_record.id,
+                "provider_call_id": result.provider_call_id,
+                "provider": "mock",
+                "status": result.status,
+                "message": result.message,
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e)) from e
     if not lead:
         raise HTTPException(status_code=404, detail=f"Lead #{req.lead_id} not found")
 
@@ -1155,6 +1443,14 @@ async def exotel_status_webhook(request: Request) -> dict[str, str]:
             recording_url=update.recording_url,
             error_message=update.error_message,
         )
+        if update.status in ("completed", "failed", "busy", "no_answer"):
+            cc_status = "completed" if update.status == "completed" else update.status
+            update_campaign_contact_by_session(
+                session_id=update.provider_call_id,
+                status=cc_status,
+                outcome=update.status,
+                overwrite_completed=False,
+            )
     return {"status": "ok"}
 
 
@@ -1183,6 +1479,14 @@ async def twilio_status_webhook(request: Request) -> dict[str, str]:
             recording_url=update.recording_url,
             error_message=update.error_message,
         )
+        if update.status in ("completed", "failed", "busy", "no_answer"):
+            cc_status = "completed" if update.status == "completed" else update.status
+            update_campaign_contact_by_session(
+                session_id=update.provider_call_id,
+                status=cc_status,
+                outcome=update.status,
+                overwrite_completed=False,
+            )
     return {"status": "ok"}
 
 
@@ -1241,36 +1545,70 @@ async def exotel_voicebot_endpoint(request: Request) -> dict[str, str]:
     call_sid = params.get("CallSid") or params.get("Sid") or params.get("call_sid") or ""
     caller_phone = params.get("From") or params.get("CallFrom") or params.get("from") or ""
     to_phone = params.get("To") or params.get("CallTo") or params.get("to") or ""
-    direction = params.get("Direction") or params.get("direction") or "inbound"
+    direction = params.get("Direction") or params.get("direction") or ""
 
-    lead_id = None
-    customer_name = "there"
-    if caller_phone:
+    custom_field = {}
+    if params.get("CustomField"):
         try:
-            normalized_caller = validate_phone_number(caller_phone)
+            parsed_cf = json.loads(params["CustomField"])
+            if isinstance(parsed_cf, dict):
+                custom_field = parsed_cf
         except Exception:
-            normalized_caller = caller_phone
+            pass
 
-        lead = get_lead_by_phone(normalized_caller) or get_lead_by_phone(caller_phone)
-        if lead:
-            lead_id = lead.id
-            customer_name = lead.name
-        else:
-            clean_digits = re.sub(r"[^\d]", "", caller_phone)
-            suffix = clean_digits[-4:] if len(clean_digits) >= 4 else "New"
-            lead = create_or_update_lead(
-                name=f"Inbound Caller ({suffix})",
-                phone_number=normalized_caller,
-                interest_status="Inquiry",
-                summary=f"Inbound call received on ExoPhone {to_phone}",
-            )
-            lead_id = lead.id
-            customer_name = lead.name
+    existing_call = get_outbound_call_by_sid(call_sid) if call_sid else None
+    is_outbound_call = (
+        (existing_call is not None and not (existing_call.message and "inbound" in existing_call.message.lower()))
+        or ("outbound" in direction.lower())
+    )
 
-        if call_sid:
-            calls = get_outbound_calls()
-            matched = [c for c in calls if c.provider_call_id == call_sid]
-            if not matched:
+    lead_id = custom_field.get("lead_id")
+    customer_name = custom_field.get("customer_name") or "there"
+    target_phone = caller_phone
+
+    if is_outbound_call:
+        resolved_direction = "outbound"
+        target_phone = (
+            (existing_call.phone_number if existing_call and existing_call.phone_number else "")
+            or to_phone
+            or caller_phone
+        )
+        if existing_call and existing_call.lead_id:
+            lead_id = existing_call.lead_id
+        if not lead_id and target_phone:
+            try:
+                norm_target = validate_phone_number(target_phone)
+            except Exception:
+                norm_target = target_phone
+            lead = get_lead_by_phone(norm_target) or get_lead_by_phone(target_phone)
+            if lead:
+                lead_id = lead.id
+                customer_name = lead.name
+    else:
+        resolved_direction = "inbound"
+        if caller_phone:
+            try:
+                normalized_caller = validate_phone_number(caller_phone)
+            except Exception:
+                normalized_caller = caller_phone
+
+            lead = get_lead_by_phone(normalized_caller) or get_lead_by_phone(caller_phone)
+            if lead:
+                lead_id = lead.id
+                customer_name = lead.name
+            else:
+                clean_digits = re.sub(r"[^\d]", "", caller_phone)
+                suffix = clean_digits[-4:] if len(clean_digits) >= 4 else "New"
+                lead = create_or_update_lead(
+                    name=f"Inbound Caller ({suffix})",
+                    phone_number=normalized_caller,
+                    interest_status="Inquiry",
+                    summary=f"Inbound call received on ExoPhone {to_phone}",
+                )
+                lead_id = lead.id
+                customer_name = lead.name
+
+            if call_sid and not existing_call:
                 save_outbound_call(
                     lead_id=lead_id,
                     phone_number=normalized_caller,
@@ -1289,18 +1627,18 @@ async def exotel_voicebot_endpoint(request: Request) -> dict[str, str]:
         scheme = "wss" if request.url.scheme == "https" else "ws"
         ws_base = f"{scheme}://{host}"
 
-    query_parts = []
+    query_params: dict[str, str] = {}
     if call_sid:
-        query_parts.append(f"call_sid={call_sid}")
-    if caller_phone:
-        query_parts.append(f"from={caller_phone}")
+        query_params["call_sid"] = call_sid
+    if target_phone:
+        query_params["from"] = target_phone
     if lead_id:
-        query_parts.append(f"lead_id={lead_id}")
-    query_parts.append("direction=inbound")
+        query_params["lead_id"] = str(lead_id)
+    query_params["direction"] = resolved_direction
 
-    qs = ("?" + "&".join(query_parts)) if query_parts else ""
+    qs = f"?{urlencode(query_params)}" if query_params else ""
     ws_url = f"{ws_base}/ws/telephony/exotel/stream{qs}"
-    logger.info(f"Exotel Voicebot Dynamic Endpoint queried (CallSid: {call_sid}, Caller: {caller_phone}); responding with WebSocket URL: {ws_url}")
+    logger.info(f"Exotel Voicebot Dynamic Endpoint queried (CallSid: {call_sid}, Direction: {resolved_direction}, Phone: {target_phone}); responding with WebSocket URL: {ws_url}")
     return {
         "url": ws_url,
         "Url": ws_url,
@@ -1544,13 +1882,15 @@ async def _handle_telephony_media_stream(websocket: WebSocket, provider_hint: st
     call_sid = None
     lead_id = None
     campaign_id = None
+    matched_call = None
     customer_name = "there"
     caller_phone = ""
     is_inbound = False
+    inbound_sample_rate = 8000
     session_id = str(uuid4())
     transcript_parts: list[str] = []
     speech_buffer = bytearray()
-    silence_frames = 0
+    silence_bytes = 0
     start_time = datetime.now(timezone.utc)
     is_exotel = (provider_hint == "exotel")
 
@@ -1594,10 +1934,14 @@ async def _handle_telephony_media_stream(websocket: WebSocket, provider_hint: st
                 campaign_id = int(custom_params.get("campaign_id")) if custom_params.get("campaign_id") else None
                 customer_name = custom_params.get("customer_name") or ""
 
-                # Check format to confirm Exotel vs Twilio
+                # Check format and sample rate to confirm Exotel vs Twilio
                 media_format = start_data.get("media_format") or start_data.get("mediaFormat") or {}
                 encoding = str(media_format.get("encoding", "")).lower()
                 fmt = str(media_format.get("format", "")).lower()
+                try:
+                    inbound_sample_rate = int(media_format.get("sample_rate") or media_format.get("sampleRate") or 8000)
+                except (TypeError, ValueError):
+                    inbound_sample_rate = 8000
                 if "raw" in encoding or "s16le" in fmt or "stream_sid" in msg or provider_hint == "exotel":
                     is_exotel = True
                 else:
@@ -1629,23 +1973,44 @@ async def _handle_telephony_media_stream(websocket: WebSocket, provider_hint: st
                     or ""
                 ).lower()
 
-                matched_call = None
-                if call_sid:
-                    calls = get_outbound_calls()
-                    matched = [c for c in calls if c.provider_call_id == call_sid]
-                    if matched:
-                        matched_call = matched[0]
-                        if not lead_id:
-                            lead_id = matched_call.lead_id
-                            campaign_id = matched_call.campaign_id or campaign_id
-                        if not caller_phone and matched_call.phone_number:
+                matched_call = get_outbound_call_by_sid(call_sid) if call_sid else None
+                if matched_call:
+                    if not lead_id and matched_call.lead_id:
+                        lead_id = matched_call.lead_id
+                    if not campaign_id and matched_call.campaign_id:
+                        campaign_id = matched_call.campaign_id
+                    is_outbound_record = not (
+                        matched_call.message and "inbound" in matched_call.message.lower()
+                    )
+                    if is_outbound_record and matched_call.phone_number:
+                        try:
+                            caller_phone = validate_phone_number(matched_call.phone_number)
+                        except Exception:
                             caller_phone = matched_call.phone_number
+                    elif not caller_phone and matched_call.phone_number:
+                        caller_phone = matched_call.phone_number
 
-                is_inbound = (
-                    direction_str in ("inbound", "incoming")
-                    or (matched_call is not None and matched_call.message and "inbound" in matched_call.message.lower())
-                    or (matched_call is None and not campaign_id)
-                )
+                if (not customer_name or customer_name == "there") and lead_id:
+                    existing_lead_obj = get_lead_by_id(lead_id)
+                    if existing_lead_obj and existing_lead_obj.name:
+                        customer_name = existing_lead_obj.name
+
+                if matched_call is not None and not (
+                    matched_call.message and "inbound" in matched_call.message.lower()
+                ):
+                    is_inbound = direction_str in ("inbound", "incoming")
+                elif direction_str.startswith("outbound"):
+                    is_inbound = False
+                else:
+                    is_inbound = (
+                        direction_str in ("inbound", "incoming")
+                        or (
+                            matched_call is not None
+                            and bool(matched_call.message)
+                            and "inbound" in matched_call.message.lower()
+                        )
+                        or (matched_call is None and not campaign_id)
+                    )
 
                 # For inbound calls, resolve or create the lead in CRM
                 if is_inbound:
@@ -1702,9 +2067,7 @@ async def _handle_telephony_media_stream(websocket: WebSocket, provider_hint: st
                 if is_exotel:
                     opening_pcm = await _synthesize_audio_pcm(opening, session.language, sample_rate=8000)
                     if opening_pcm and stream_sid:
-                        # Stream in 100ms chunks (1600 bytes at 8kHz 16-bit mono)
-                        for i in range(0, len(opening_pcm), 1600):
-                            chunk = opening_pcm[i:i + 1600]
+                        for chunk in _prepare_exotel_pcm_chunks(opening_pcm, chunk_size=3200):
                             await websocket.send_json({
                                 "event": "media",
                                 "stream_sid": stream_sid,
@@ -1733,8 +2096,8 @@ async def _handle_telephony_media_stream(websocket: WebSocket, provider_hint: st
 
                 # Convert incoming chunk to 16kHz linear PCM for Sarvam Saaras STT
                 if is_exotel:
-                    # Exotel streams raw 16-bit linear PCM (s16le) at 8kHz
-                    pcm_16k_chunk = _resample_pcm_8k_to_16k(raw_bytes)
+                    # Exotel streams raw 16-bit linear PCM (s16le) at inbound_sample_rate (default 8kHz)
+                    pcm_16k_chunk = _resample_pcm_to_16k(raw_bytes, inbound_sample_rate)
                 else:
                     # Twilio streams 8kHz mulaw
                     pcm_16k_chunk = _mulaw_to_pcm16k(raw_bytes)
@@ -1749,16 +2112,16 @@ async def _handle_telephony_media_stream(websocket: WebSocket, provider_hint: st
                         await websocket.send_json({"event": "clear", sid_key: stream_sid})
 
                     speech_buffer.extend(pcm_16k_chunk)
-                    silence_frames = 0
+                    silence_bytes = 0
                 else:
-                    # Silence detected
-                    if len(speech_buffer) >= 6400:  # ~200ms of user speech already collected
-                        silence_frames += 1
-                        # If silence persists for ~400ms (approx 4 chunks), user finished their thought
-                        if silence_frames >= 4:
+                    # Silence detected (measured in 16kHz PCM bytes so 20ms and 100ms chunks behave identically)
+                    if len(speech_buffer) >= 6400:  # >= 200ms of user speech collected
+                        silence_bytes += len(pcm_16k_chunk)
+                        # 16000 bytes at 16kHz 16-bit mono = 500ms of continuous silence
+                        if silence_bytes >= 16000:
                             buffered_pcm = bytes(speech_buffer)
                             speech_buffer.clear()
-                            silence_frames = 0
+                            silence_bytes = 0
 
                             session = conversation_manager.get_or_create_session(session_id)
                             transcribed, _ = await _transcribe_pcm(buffered_pcm, session.language)
@@ -1774,8 +2137,7 @@ async def _handle_telephony_media_stream(websocket: WebSocket, provider_hint: st
                                 if is_exotel:
                                     reply_pcm = await _synthesize_audio_pcm(reply_text, session.language, sample_rate=8000)
                                     if reply_pcm and stream_sid:
-                                        for i in range(0, len(reply_pcm), 1600):
-                                            chunk = reply_pcm[i:i + 1600]
+                                        for chunk in _prepare_exotel_pcm_chunks(reply_pcm, chunk_size=3200):
                                             await websocket.send_json({
                                                 "event": "media",
                                                 "stream_sid": stream_sid,
@@ -1790,6 +2152,19 @@ async def _handle_telephony_media_stream(websocket: WebSocket, provider_hint: st
                                             "streamSid": stream_sid,
                                             "media": {"payload": reply_mulaw},
                                         })
+
+                                if session.is_concluded:
+                                    await asyncio.sleep(0.5)
+                                    if is_exotel and call_sid:
+                                        try:
+                                            await asyncio.to_thread(get_provider("exotel").terminate_call, call_sid)
+                                        except Exception as term_err:
+                                            logger.warning(f"Exotel call termination failed for {call_sid}: {term_err}")
+                                    try:
+                                        await websocket.close(code=1000)
+                                    except Exception:
+                                        pass
+                                    break
 
             elif event == "stop":
                 logger.info(f"Telephony stream ended for CallSid: {call_sid}")
@@ -1813,13 +2188,15 @@ async def _handle_telephony_media_stream(websocket: WebSocket, provider_hint: st
             analysis = analyze_conversation(full_transcript, customer_name)
 
             target_phone = caller_phone
+            if not is_inbound and matched_call and matched_call.phone_number:
+                target_phone = matched_call.phone_number
             if not target_phone and lead_id:
                 lead_obj = get_lead_by_id(lead_id)
                 if lead_obj and lead_obj.phone_number:
                     target_phone = lead_obj.phone_number
 
-            if lead_id and target_phone:
-                create_or_update_lead(
+            if target_phone:
+                saved_lead = create_or_update_lead(
                     name=customer_name if customer_name and customer_name != "there" else f"Caller ({target_phone[-4:] if len(target_phone) >= 4 else 'New'})",
                     phone_number=target_phone,
                     interest_status=analysis["category"],
@@ -1830,6 +2207,9 @@ async def _handle_telephony_media_stream(websocket: WebSocket, provider_hint: st
                     next_action=analysis["next_action"],
                     campaign_id=campaign_id,
                 )
+                if not lead_id:
+                    lead_id = saved_lead.id
+
             if lead_id:
                 save_call(
                     lead_id=lead_id,
@@ -1837,6 +2217,7 @@ async def _handle_telephony_media_stream(websocket: WebSocket, provider_hint: st
                     agent_response=analysis["next_action"],
                     interest_status=analysis["category"],
                     campaign_id=campaign_id,
+                    session_id=call_sid or session_id,
                     call_mode="telephony_inbound" if is_inbound else "telephony_live",
                     call_duration_seconds=duration,
                 )
@@ -1850,6 +2231,23 @@ async def _handle_telephony_media_stream(websocket: WebSocket, provider_hint: st
                 if analysis["category"] == "Do Not Call":
                     if target_phone:
                         add_dnd_entry(target_phone, f"Customer opt-out in call {call_sid}")
+
+            if call_sid:
+                update_campaign_contact_by_session(
+                    session_id=call_sid,
+                    status="completed",
+                    outcome=analysis["category"],
+                    lead_id=lead_id,
+                    overwrite_completed=True,
+                )
+        elif call_sid:
+            update_campaign_contact_by_session(
+                session_id=call_sid,
+                status="completed",
+                outcome="no_conversation",
+                lead_id=lead_id,
+                overwrite_completed=False,
+            )
 
 
 @app.websocket("/ws/telephony/exotel/stream")

@@ -20,3 +20,4 @@ data/*.db
 # Audio test files
 test_audio.wav
 *.wav
+!tests/fixtures/*.wav

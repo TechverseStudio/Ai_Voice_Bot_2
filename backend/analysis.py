@@ -265,6 +265,17 @@ def analyze_conversation(
             site_visit_time = time_m.group(0).upper()
             evidence["preferred_meeting_time"] = f"Customer preferred time: {site_visit_time}"
 
+    # Human Escalation Request
+    human_escalation_requested = any(
+        phrase in lowered for phrase in (
+            "talk to a human", "speak to a human", "speak to a person", "talk to a person",
+            "real person", "human agent", "talk to human", "speak with human", "human please",
+            "connect to agent", "connect to manager", "sales manager", "human representative"
+        )
+    )
+    if human_escalation_requested:
+        evidence["human_escalation"] = "Customer explicitly requested to speak with a human sales specialist"
+
     # Objections
     objections = []
     if any(p in lowered for p in ("price is high", "too expensive", "costly", "out of budget", "budget is less")):
@@ -366,6 +377,7 @@ def analyze_conversation(
             "customer_consent": True,
         },
         "evidence": evidence,
+        "human_escalation_requested": human_escalation_requested,
         "objections": objections,
         "questions_asked": questions,
         "summary": summary,
