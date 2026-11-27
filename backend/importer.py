@@ -9,8 +9,15 @@ import subprocess
 from typing import Any
 
 import pandas as pd
-from pypdf import PdfReader
-import docx
+try:
+    from pypdf import PdfReader
+except ImportError:
+    PdfReader = None
+
+try:
+    import docx
+except ImportError:
+    docx = None
 
 from backend.crm import is_phone_dnd, get_lead_by_phone
 
@@ -209,6 +216,8 @@ def parse_csv_file(file_path: str) -> list[dict[str, Any]]:
 
 def parse_word_docx(file_path: str) -> list[dict[str, Any]]:
     """Parse Word Document (.docx) checking both tables and paragraphs."""
+    if docx is None:
+        raise RuntimeError("python-docx is not installed. Please install python-docx to process .docx files.")
     doc = docx.Document(file_path)
     rows = []
 

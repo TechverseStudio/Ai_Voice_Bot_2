@@ -373,6 +373,9 @@ class ActiveCallChannel(Base):
 engine_options = {"pool_pre_ping": True}
 if DATABASE_URL.startswith("sqlite"):
     engine_options["connect_args"] = {"check_same_thread": False}
+    db_file = DATABASE_URL.replace("sqlite:///", "")
+    if db_file and not db_file.startswith(":memory:"):
+        Path(db_file).parent.mkdir(parents=True, exist_ok=True)
 elif DATABASE_URL.startswith("postgresql"):
     engine_options.update({
         "pool_size": DB_POOL_SIZE,
